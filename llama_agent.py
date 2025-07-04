@@ -1,80 +1,80 @@
-import threading
 from llama_cpp import Llama
-from llama_cpp_agent.chat_history import BasicChatMessageStore
+import uuid
 
-class LlamaAgent:
-    def __init__(self, model_path, context_size=2048):
+class SessionManager:
+    def __init__(self, model_path, context_size=2048, n_parallel=5):
         self.llm = Llama(
             model_path=model_path,
             n_ctx=context_size,
             n_gpu_layers=-1,
             use_mlock=True,
-            n_threads=4,
-            offload_kqv=True
+            n_threads=8,  # More threads for parallel processing
+            n_parallel=n_parallel,  # Key parameter for concurrency
+            offload_kqv=True,
+            verbose=False
         )
-        self.lock = threading.Lock()
-        self.message_store = BasicChatMessageStore()
-        self.sessions = {}  # session_id: state object
-        
-    def start_session(self, session_id):
+        self.sessions = {}
+        self.system_prompt = "You are a helpful assistant. Keep responses concise and clear."
+    
+    def create_session(self):
         """Initialize new session with empty KV cache"""
-        with self.lock:
-            if session_id in self.sessions:
-                raise ValueError("Session already exists")
-            
-            # Initialize state and history
-            self.sessions[session_id] = self.llm.create_state()
-            self.message_store.add_chat_history(session_id)
-            
-            # Add system prompt
-            self.message_store.add_message(
-                session_id, 
-                "system", 
-                "You are a helpful assistant. Keep responses concise and clear."
-            )
+        session_id = str(uuid.uuid4())
+        self.sessions[session_id] = {
+            'state': self.llm.create_state(),
+            'history': [
+                {"role": "system", "content": self.system_prompt}
+            ]
+        }
+        
+        # Initialize state with system prompt
+        self._eval_prompt(session_id, self.system_prompt)
         return session_id
     
-    def chat(self, session_id, message):
-        """Process message using session's KV cache"""
+    def _eval_prompt(self, session_id, prompt):
+        """Process prompt through model without generation"""
+        session = self.sessions[session_id]
+        self.llm.eval(
+            tokens=self.llm.tokenize(prompt.encode("utf-8")),
+            state=session['state']
+        )
+    
+    def process_message(self, session_id, message):
+        """Handle message using session's KV cache"""
         if session_id not in self.sessions:
             raise ValueError("Invalid session ID")
         
-        # Add user message to history
-        self.message_store.add_message(session_id, "user", message)
+        session = self.sessions[session_id]
         
-        with self.lock:
-            state = self.sessions[session_id]
-            
-            # Generate response using cached state
-            output = self.llm.create_completion(
-                prompt=message,
-                state=state,
-                max_tokens=200,
-                temperature=0.7,
-                stop=["\n", "###"],
-                stream=False
-            )
-            
-            # Update session state
-            self.sessions[session_id] = state
-            
-            reply = output['choices'][0]['text']
+        # Format user message and update history
+        user_prompt = f"User: {message}\nAssistant:"
+        session['history'].append({"role": "user", "content": message})
         
-        # Save assistant response
-        self.message_store.add_message(session_id, "assistant", reply)
+        # Process user message through model
+        self._eval_prompt(session_id, user_prompt)
+        
+        # Generate response
+        output = self.llm.create_completion(
+            prompt="",  # Use existing state
+            state=session['state'],
+            max_tokens=200,
+            temperature=0.7,
+            stop=["\n", "###"],
+            stream=False
+        )
+        
+        # Extract and store response
+        reply = output['choices'][0]['text'].strip()
+        session['history'].append({"role": "assistant", "content": reply})
+        
         return reply
     
     def end_session(self, session_id):
         """Clean up session resources"""
-        if session_id not in self.sessions:
-            return False
-            
-        with self.lock:
-            # Free resources (state cleanup handled by GC)
+        if session_id in self.sessions:
             del self.sessions[session_id]
-            self.message_store.delete_chat_history(session_id)
-        return True
+            return True
+        return False
 
-# Global agent instance (singleton pattern)
+# Global session manager (thread-safe through llama.cpp parallel processing)
 MODEL_PATH = "./models/your_model.gguf"  # UPDATE THIS
-agent = LlamaAgent(MODEL_PATH)
+session_manager = SessionManager(MODEL_PATH, n_parallel=5)
